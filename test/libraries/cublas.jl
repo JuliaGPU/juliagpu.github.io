@@ -124,6 +124,10 @@ end
             dy = CUBLAS.gemv('N', dA, dx)
             hy = collect(dy)
             @test hy ≈ A * x
+            dy = CuArray(y)
+            dx = CUBLAS.gemv('T', alpha, dA, dy)
+            hx = collect(dx)
+            @test hx ≈ alpha * A' * y
         end
 
         if CUBLAS.version() >= v"11.9"
@@ -150,6 +154,16 @@ end
                     y[i] = alpha * A[i] * x[i] + beta * y[i]
                     @test y[i] ≈ hy
                 end
+                dy = CuArray{elty, 1}[]
+                for i=1:length(A)
+                    push!(dy, CuArray(y[i]))
+                end
+                CUBLAS.gemv_batched!('T', alpha, dA, dy, beta, dx)
+                for i=1:size(A, 3)
+                    hx = collect(dx[:, i])
+                    x[:, i] = alpha * transpose(A[:, :, i]) * y[:, i] + beta * y[:, i]
+                    @test x[:, i] ≈ hx
+                end
             end
         end
 
@@ -172,6 +186,13 @@ end
                     hy = collect(dy[:, i])
                     y[:, i] = alpha * A[:, :, i] * x[:, i] + beta * y[:, i]
                     @test y[:, i] ≈ hy
+                end
+                dy = CuArray(y)
+                CUBLAS.gemv_strided_batched!('T', alpha, dA, dy, beta, dx)
+                for i=1:size(A, 3)
+                    hx = collect(dx[:, i])
+                    x[:, i] = alpha * transpose(A[:, :, i]) * y[:, i] + beta * y[:, i]
+                    @test x[:, i] ≈ hx
                 end
             end
         end

@@ -423,8 +423,8 @@ for (fname, fname_64, eltyin, eltyout) in (
                 end
             end
 
-            m = size(A[1], trans == 'N' ? 1 : 2)
-            n = size(A[1], trans == 'N' ? 2 : 1)
+            m = size(A[1], 1)
+            n = size(A[1], 2)
             lda = max(1,stride(A[1],2))
             incx = stride(x[1],1)
             incy = stride(y[1],1)

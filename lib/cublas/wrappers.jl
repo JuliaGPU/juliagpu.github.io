@@ -115,7 +115,7 @@ for (fname, fname_64, elty) in ((:cublasDscal_v2, :cublasDscal_v2_64, :Float64),
                                 (:cublasCscal_v2, :cublasCscal_v2_64, :ComplexF32))
     @eval begin
         function scal!(n::Integer,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        x::StridedCuVecOrDenseMat{$elty})
             if CUBLAS.version() >= v"12.0"
                 $fname_64(handle(), n, alpha, x, stride(x, 1))
@@ -126,9 +126,21 @@ for (fname, fname_64, elty) in ((:cublasDscal_v2, :cublasDscal_v2_64, :Float64),
         end
     end
 end
+function scal!(n::Integer, alpha::Number, x::StridedCuVecOrDenseMat{T}) where {T}
+    α = convert(T, alpha)
+    gpu_α = CuRef{T}(α) 
+    scal!(n, gpu_α, x)
+    synchronize()
+    x
+end
+function scal!(n::Integer, alpha::CuRefArray{Float32, CuVector{Float32, DeviceMemory}}, x::StridedCuVecOrDenseMat{Float16})
+    cublasScalEx(handle(), n, alpha, Float32, x, Float16, stride(x, 1), Float32)
+    return x
+end
 function scal!(n::Integer, alpha::Number, x::StridedCuVecOrDenseMat{Float16})
-    α = convert(Float32, alpha)
-    cublasScalEx(handle(), n, Ref{Float32}(α), Float32, x, Float16, stride(x, 1), Float32)
+    α = CuRef{Float32}( convert(Float32, alpha) )
+    x = scal!(n, α, x)
+    synchronize()
     return x
 end
 # specific variants in case x is complex and alpha is real
@@ -136,7 +148,7 @@ for (fname, fname_64, elty, celty) in ((:cublasCsscal_v2, :cublasCsscal_v2_64, :
                                        (:cublasZdscal_v2, :cublasZdscal_v2_64, :Float64, :ComplexF64))
     @eval begin
         function scal!(n::Integer,
-                       alpha::$elty,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        x::StridedCuVecOrDenseMat{$celty})
             if CUBLAS.version() >= v"12.0"
                 $fname_64(handle(), n, alpha, x, stride(x, 1))
@@ -147,15 +159,31 @@ for (fname, fname_64, elty, celty) in ((:cublasCsscal_v2, :cublasCsscal_v2_64, :
         end
     end
 end
-function scal!(n::Integer, alpha::Number, x::StridedCuVecOrDenseMat{ComplexF16})
+function scal!(n::Integer, alpha::Real, x::StridedCuVecOrDenseMat{T}) where {T<:Complex}
+    α = convert(real(T), alpha)
+    gpu_α = CuRef{real(T)}(α) 
+    scal!(n, gpu_α, x)
+    synchronize()
+    x
+end
+function scal!(n::Integer, alpha::Real, x::StridedCuVecOrDenseMat{ComplexF16})
     wide_x = widen.(x)
-    scal!(n, alpha, wide_x)
+    gpu_α = CuRef{Float32}( convert(Float32, alpha) )
+    scal!(n, gpu_α, wide_x)
+    thin_x = convert(typeof(x), wide_x)
+    copyto!(x, thin_x)
+    return x
+end
+function scal!(n::Integer, alpha::Complex, x::StridedCuVecOrDenseMat{ComplexF16})
+    wide_x = widen.(x)
+    gpu_α = CuRef{ComplexF32}( convert(ComplexF32, alpha) )
+    scal!(n, gpu_α, wide_x)
     thin_x = convert(typeof(x), wide_x)
     copyto!(x, thin_x)
     return x
 end
 
-## dot, dotc, dotu
+
 for (jname, fname, fname_64, elty) in ((:dot, :cublasDdot_v2, :cublasDdot_v2_64, :Float64),
                                        (:dot, :cublasSdot_v2, :cublasSdot_v2_64, :Float32),
                                        (:dotc, :cublasZdotc_v2, :cublasZdotc_v2_64, :ComplexF64),
@@ -165,20 +193,62 @@ for (jname, fname, fname_64, elty) in ((:dot, :cublasDdot_v2, :cublasDdot_v2_64,
     @eval begin
         function $jname(n::Integer,
                         x::StridedCuVecOrDenseMat{$elty},
-                        y::StridedCuVecOrDenseMat{$elty})
-            result = Ref{$elty}()
+                        y::StridedCuVecOrDenseMat{$elty},
+                        result::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
+                       )
             if CUBLAS.version() >= v"12.0"
                 $fname_64(handle(), n, x, stride(x, 1), y, stride(y, 1), result)
             else
                 $fname(handle(), n, x, stride(x, 1), y, stride(y, 1), result)
             end
-            return result[]
+            return result
         end
     end
 end
-function dot(n::Integer, x::StridedCuVecOrDenseMat{Float16}, y::StridedCuVecOrDenseMat{Float16})
-    result = Ref{Float16}()
+
+function dot(n::Integer,
+             x::StridedCuVecOrDenseMat{T},
+             y::StridedCuVecOrDenseMat{T},
+            ) where {T<:Union{Float32, Float64}}
+    gpu_result = CuRef{T}(zero(T))
+    gpu_result = dot(n, x, y, gpu_result)
+    synchronize()
+    result = Array(gpu_result.x)
+    return result[]
+end
+
+function dotc(n::Integer,
+              x::StridedCuVecOrDenseMat{T},
+              y::StridedCuVecOrDenseMat{T},
+            ) where {T<:Union{ComplexF32, ComplexF64}}
+    gpu_result = CuRef{T}(zero(T))
+    dotc(n, x, y, gpu_result)
+    synchronize()
+    result = Array(gpu_result.x)
+    return result[]
+end
+
+function dotu(n::Integer,
+              x::StridedCuVecOrDenseMat{T},
+              y::StridedCuVecOrDenseMat{T},
+            ) where {T<:Union{ComplexF32, ComplexF64}}
+    gpu_result = CuRef{T}(zero(T))
+    dotu(n, x, y, gpu_result)
+    synchronize()
+    result = Array(gpu_result.x)
+    return result[]
+end
+
+function dot(n::Integer, x::StridedCuVecOrDenseMat{Float16}, y::StridedCuVecOrDenseMat{Float16}, result::CuRefArray{Float16, CuVector{Float16, DeviceMemory}})
     cublasDotEx(handle(), n, x, Float16, stride(x, 1), y, Float16, stride(y, 1), result, Float16, Float32)
+    return result
+end
+
+function dot(n::Integer, x::StridedCuVecOrDenseMat{Float16}, y::StridedCuVecOrDenseMat{Float16})
+    gpu_result = CuRef{Float16}(zero(Float16))
+    gpu_result = dot(n, x, y, gpu_result)
+    synchronize()
+    result = Array{Float16}(gpu_result.x)
     return result[]
 end
 function dotc(n::Integer, x::StridedCuVecOrDenseMat{ComplexF16}, y::StridedCuVecOrDenseMat{ComplexF16})
@@ -195,28 +265,47 @@ for (fname, fname_64, elty, ret_type) in ((:cublasDnrm2_v2, :cublasDnrm2_v2_64, 
                                           (:cublasScnrm2_v2, :cublasScnrm2_v2_64, :ComplexF32, :Float32))
     @eval begin
         function nrm2(n::Integer,
-                      X::StridedCuVecOrDenseMat{$elty})
-            result = Ref{$ret_type}()
+                      X::StridedCuVecOrDenseMat{$elty},
+                      result::CuRefArray{$ret_type, CuVector{$ret_type,  DeviceMemory}},
+                     )
             if CUBLAS.version() >= v"12.0"
                 $fname_64(handle(), n, X, stride(X, 1), result)
             else
                 $fname(handle(), n, X, stride(X, 1), result)
             end
+            return result
+        end
+        function nrm2(n::Integer,
+                      X::StridedCuVecOrDenseMat{$elty})
+            gpu_result = CuRef{$ret_type}(zero($ret_type)) 
+            nrm2(n, X, gpu_result)
+            synchronize()
+            result = Array(gpu_result.x)
             return result[]
         end
     end
 end
-nrm2(x::StridedCuVecOrDenseMat) = nrm2(length(x), x)
 
-function nrm2(n::Integer, x::StridedCuVecOrDenseMat{Float16})
-    result = Ref{Float16}()
+nrm2(x::StridedCuVecOrDenseMat) = nrm2(length(x), x)
+nrm2(x::StridedCuVecOrDenseMat, result::CuVector) = nrm2(length(x), x, result)
+
+function nrm2(n::Integer, x::StridedCuVecOrDenseMat{Float16}, result::CuRefArray{Float16, CuVector{Float16, DeviceMemory}})
     cublasNrm2Ex(handle(), n, x, Float16, stride(x, 1), result, Float16, Float32)
+    return result
+end
+function nrm2(n::Integer, x::StridedCuVecOrDenseMat{Float16})
+    gpu_result = CuRef{Float16}(zero(Float16))
+    nrm2(n, x, gpu_result)
+    synchronize()
+    result = Array(gpu_result.x)
     return result[]
 end
 function nrm2(n::Integer, x::StridedCuVecOrDenseMat{ComplexF16})
     wide_x = widen.(x)
-    nrm    = nrm2(n, wide_x)
-    return convert(Float16, nrm)
+    wide_result = CuRef{Float32}(zero(Float32))
+    nrm2(n, wide_x, wide_result)
+    synchronize()
+    return convert(Float16, only(Array{Float32}(wide_result.x)))
 end
 
 ## asum
@@ -226,13 +315,21 @@ for (fname, fname_64, elty, ret_type) in ((:cublasDasum_v2, :cublasDasum_v2_64, 
                                           (:cublasScasum_v2, :cublasScasum_v2_64, :ComplexF32, :Float32))
     @eval begin
         function asum(n::Integer,
-                      x::StridedCuVecOrDenseMat{$elty})
-            result = Ref{$ret_type}()
+                      x::StridedCuVecOrDenseMat{$elty},
+                      result::CuRefArray{$ret_type, CuVector{$ret_type,  DeviceMemory}},
+                     )
             if CUBLAS.version() >= v"12.0"
                 $fname_64(handle(), n, x, stride(x, 1), result)
             else
                 $fname(handle(), n, x, stride(x, 1), result)
             end
+            return result
+        end
+        function asum(n::Integer,
+                      x::StridedCuVecOrDenseMat{$elty})
+            gpu_result = CuRef{$ret_type}(zero($ret_type))
+            asum(n, x, gpu_result)
+            result = Array(gpu_result.x)
             return result[]
         end
     end
@@ -245,7 +342,7 @@ for (fname, fname_64, elty) in ((:cublasDaxpy_v2, :cublasDaxpy_v2_64, :Float64),
                                 (:cublasCaxpy_v2, :cublasCaxpy_v2_64, :ComplexF32))
     @eval begin
         function axpy!(n::Integer,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        dx::StridedCuVecOrDenseMat{$elty},
                        dy::StridedCuVecOrDenseMat{$elty})
             if CUBLAS.version() >= v"12.0"
@@ -257,12 +354,22 @@ for (fname, fname_64, elty) in ((:cublasDaxpy_v2, :cublasDaxpy_v2_64, :Float64),
         end
     end
 end
-
-function axpy!(n::Integer, alpha::Number, dx::StridedCuVecOrDenseMat{Float16}, dy::StridedCuVecOrDenseMat{Float16})
-    α = convert(Float32, alpha)
-    cublasAxpyEx(handle(), n, Ref{Float32}(α), Float32, dx, Float16, stride(dx, 1), dy, Float16, stride(dy, 1), Float32)
+function axpy!(n::Integer,
+               alpha::CuRefArray{Float16, CuVector{Float16, DeviceMemory}},
+               dx::StridedCuVecOrDenseMat{Float16},
+               dy::StridedCuVecOrDenseMat{Float16})
+    α = CuRefArray(widen.(alpha.x))
+    cublasAxpyEx(handle(), n, α, Float32, dx, Float16, stride(dx, 1), dy, Float16, stride(dy, 1), Float32)
     return dy
 end
+function axpy!(n::Integer,
+               alpha::CuRefArray{Float32, CuVector{Float32, DeviceMemory}},
+               dx::StridedCuVecOrDenseMat{Float16},
+               dy::StridedCuVecOrDenseMat{Float16})
+    cublasAxpyEx(handle(), n, alpha, Float32, dx, Float16, stride(dx, 1), dy, Float16, stride(dy, 1), Float32)
+    return dy
+end
+
 function axpy!(n::Integer, alpha::Number, dx::StridedCuVecOrDenseMat{ComplexF16}, dy::StridedCuVecOrDenseMat{ComplexF16})
     wide_x = widen.(dx)
     wide_y = widen.(dy)
@@ -271,26 +378,45 @@ function axpy!(n::Integer, alpha::Number, dx::StridedCuVecOrDenseMat{ComplexF16}
     copyto!(dy, thin_y)
     return dy
 end
+function axpy!(n::Integer, alpha::Number, dx::StridedCuVecOrDenseMat{T}, dy::StridedCuVecOrDenseMat{T}) where {T}
+    gpu_alpha = CuRef{T}( convert(T, alpha) )
+    dy = axpy!(n, gpu_alpha, dx, dy)
+    synchronize()
+    return dy
+end
+
 
 ## rot
-for (fname, fname_64, elty, sty) in ((:cublasSrot_v2, :cublasSrot_v2_64, :Float32, :Number),
-                                     (:cublasDrot_v2, :cublasDrot_v2_64, :Float64, :Number),
-                                     (:cublasCrot_v2, :cublasCrot_v2_64, :ComplexF32, :Number),
-                                     (:cublasCsrot_v2, :cublasCsrot_v2_64, :ComplexF32, :Real),
-                                     (:cublasZrot_v2, :cublasZrot_v2_64, :ComplexF64, :Number),
-                                     (:cublasZdrot_v2, :cublasZdrot_v2_64, :ComplexF64, :Real))
+for (fname, fname_64, elty, cty, sty) in ((:cublasSrot_v2, :cublasSrot_v2_64, :Float32, :Float32, :Float32),
+                                          (:cublasDrot_v2, :cublasDrot_v2_64, :Float64, :Float64, :Float64),
+                                          (:cublasCrot_v2, :cublasCrot_v2_64, :ComplexF32, :Float32, :ComplexF32),
+                                          (:cublasCsrot_v2, :cublasCsrot_v2_64, :ComplexF32, :Float32, :Float32),
+                                          (:cublasZrot_v2, :cublasZrot_v2_64, :ComplexF64, :Float64, :ComplexF64),
+                                          (:cublasZdrot_v2, :cublasZdrot_v2_64, :ComplexF64, :Float64, :Float64))
     @eval begin
         function rot!(n::Integer,
                       x::StridedCuVecOrDenseMat{$elty},
                       y::StridedCuVecOrDenseMat{$elty},
-                      c::Real,
-                      s::$sty)
+                      c::CuRefArray{$cty, CuVector{$cty,  DeviceMemory}},
+                      s::CuRefArray{$sty, CuVector{$sty,  DeviceMemory}},
+                     )
             if CUBLAS.version() >= v"12.0"
                 $fname_64(handle(), n, x, stride(x, 1), y, stride(y, 1), c, s)
             else
                 $fname(handle(), n, x, stride(x, 1), y, stride(y, 1), c, s)
             end
             x, y
+        end
+        function rot!(n::Integer,
+                      x::StridedCuVecOrDenseMat{$elty},
+                      y::StridedCuVecOrDenseMat{$elty},
+                      c::$cty,
+                      s::$sty)
+            gpu_c = CuRef{$cty}( convert($cty, c) )
+            gpu_s = CuRef{$sty}( convert($sty, s) )
+            x, y = rot!(n, x, y, gpu_c, gpu_s)
+            synchronize()
+            return x, y
         end
     end
 end
@@ -315,6 +441,15 @@ for (fname, fname_64, elty) in ((:cublasSswap_v2, :cublasSswap_v2_64, :Float32),
 end
 
 function axpby!(n::Integer,
+                alpha::CuRefArray{T, CuVector{T,  DeviceMemory}},
+                dx::StridedCuVecOrDenseMat{T},
+                beta::CuRefArray{T, CuVector{T,  DeviceMemory}},
+                dy::StridedCuVecOrDenseMat{T}) where T <: Union{Float16, ComplexF16, CublasFloat}
+            scal!(n, beta, dy)
+            axpy!(n, alpha, dx, dy)
+            dy
+end
+function axpby!(n::Integer,
                 alpha::Number,
                 dx::StridedCuVecOrDenseMat{T},
                 beta::Number,
@@ -332,19 +467,18 @@ for (fname, fname_64, elty) in ((:cublasIdamax_v2, :cublasIdamax_v2_64, :Float64
                                 (:cublasIcamax_v2, :cublasIcamax_v2_64, :ComplexF32))
     @eval begin
         function iamax(n::Integer,
-                       dx::StridedCuVecOrDenseMat{$elty})
+                       dx::StridedCuVecOrDenseMat{$elty},
+                       result::CuRefArray{Ti, CuVector{Ti, DeviceMemory}},
+                      ) where {Ti<:Integer}
             if CUBLAS.version() >= v"12.0"
-                result = Ref{Int64}()
                 $fname_64(handle(), n, dx, stride(dx, 1), result)
             else
-                result = Ref{Cint}()
                 $fname(handle(), n, dx, stride(dx, 1), result)
             end
-            return result[]
+            return result
         end
     end
 end
-iamax(dx::StridedCuVecOrDenseMat) = iamax(length(dx), dx)
 
 ## iamin
 # iamin is not in standard blas is a CUBLAS extension
@@ -354,19 +488,34 @@ for (fname, fname_64, elty) in ((:cublasIdamin_v2, :cublasIdamin_v2_64, :Float64
                                 (:cublasIcamin_v2, :cublasIcamin_v2_64, :ComplexF32))
     @eval begin
         function iamin(n::Integer,
-                       dx::StridedCuVecOrDenseMat{$elty},)
+                       dx::StridedCuVecOrDenseMat{$elty},
+                       result::CuRefArray{Ti, CuVector{Ti, DeviceMemory}},
+                      ) where {Ti<:Integer}
             if CUBLAS.version() >= v"12.0"
-                result = Ref{Int64}()
                 $fname_64(handle(), n, dx, stride(dx, 1), result)
             else
-                result = Ref{Cint}()
                 $fname(handle(), n, dx, stride(dx, 1), result)
             end
-            return result[]
+            return result
         end
     end
 end
-iamin(dx::StridedCuVecOrDenseMat) = iamin(length(dx), dx)
+
+for fname in (:iamax, :iamin)
+    @eval begin
+        function $fname(n::Integer,
+                        dx::StridedCuVecOrDenseMat)
+            result_type = CUBLAS.version() >= v"12.0" ? Int64 : Cint
+            gpu_result  = CuRef{result_type}(zero(result_type))
+            gpu_result  = $fname(n, dx, gpu_result)
+            synchronize()
+            result = Array{result_type}(gpu_result.x)
+            return only(result)
+        end
+        $fname(dx::StridedCuVecOrDenseMat) = $fname(length(dx), dx)
+        $fname(dx::StridedCuVecOrDenseMat, result::CuRefArray) = $fname(length(dx), dx, result)
+    end
+end
 
 # Level 2
 ## mv
@@ -377,10 +526,10 @@ for (fname, fname_64, elty) in ((:cublasDgemv_v2, :cublasDgemv_v2_64, :Float64),
                                 (:cublasCgemv_v2, :cublasCgemv_v2_64, :ComplexF32))
     @eval begin
         function gemv!(trans::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
                        x::StridedCuVector{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty, DeviceMemory}},
                        y::StridedCuVector{$elty})
             # handle trans
             m,n = size(A)
@@ -399,28 +548,40 @@ for (fname, fname_64, elty) in ((:cublasDgemv_v2, :cublasDgemv_v2_64, :Float64),
         end
     end
 end
+function gemv!(trans::Char, alpha::Number, A::StridedCuMatrix{T}, x::StridedCuVector{T}, beta::Number, y::StridedCuVector{T}) where T
+    gpu_α = CuRef( convert(T, alpha) )
+    gpu_β = CuRef( convert(T, beta) )
+    y = gemv!(trans, gpu_α, A, x, gpu_β, y)
+    synchronize()
+    return y
+end
+function gemv(trans::Char, alpha::CuRefArray{T, CuVector{T,  DeviceMemory}},
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    gemv!(trans, alpha, A, x, CuRef{T}(zero(T)), similar(x, size(A, (trans == 'N' ? 1 : 2))))
+end
 function gemv(trans::Char, alpha::Number,
               A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
     gemv!(trans, alpha, A, x, zero(T), similar(x, size(A, (trans == 'N' ? 1 : 2))))
 end
+# should this be async?
 function gemv(trans::Char, A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
     gemv!(trans, one(T), A, x, zero(T), similar(x, T, size(A, (trans == 'N' ? 1 : 2))))
 end
 
-for (fname, fname_64, eltyin, eltyout) in (
-    (:cublasDgemvBatched, :cublasDgemvBatched_64, :Float64, :Float64),
-    (:cublasSgemvBatched, :cublasSgemvBatched_64, :Float32, :Float32),
-    (:cublasHSHgemvBatched, :cublasHSHgemvBatched, :Float16, :Float16),
-    (:cublasHSSgemvBatched, :cublasHSSgemvBatched, :Float16, :Float32),
-    (:cublasZgemvBatched, :cublasZgemvBatched_64, :ComplexF64, :ComplexF64),
-    (:cublasCgemvBatched, :cublasCgemvBatched_64, :ComplexF32, :ComplexF32))
+for (fname, fname_64, eltyin, eltyout, eltyconst) in (
+    (:cublasDgemvBatched, :cublasDgemvBatched_64, :Float64, :Float64, :Float64),
+    (:cublasSgemvBatched, :cublasSgemvBatched_64, :Float32, :Float32, :Float32),
+    (:cublasHSHgemvBatched, :cublasHSHgemvBatched, :Float16, :Float16, :Float32),
+    (:cublasHSSgemvBatched, :cublasHSSgemvBatched, :Float16, :Float32, :Float32),
+    (:cublasZgemvBatched, :cublasZgemvBatched_64, :ComplexF64, :ComplexF64, :ComplexF64),
+    (:cublasCgemvBatched, :cublasCgemvBatched_64, :ComplexF32, :ComplexF32, :ComplexF32))
     @eval begin
         function gemv_batched!(trans::Char,
-                            alpha::Number,
-                            A::Vector{<:StridedCuMatrix{$eltyin}},
-                            x::Vector{<:StridedCuVector{$eltyin}},
-                            beta::Number,
-                            y::Vector{<:StridedCuVector{$eltyout}})
+                               alpha::CuRefArray{$eltyconst, CuVector{$eltyconst,  DeviceMemory}},
+                               A::Vector{<:StridedCuMatrix{$eltyin}},
+                               x::Vector{<:StridedCuVector{$eltyin}},
+                               beta::CuRefArray{$eltyconst, CuVector{$eltyconst,  DeviceMemory}},
+                               y::Vector{<:StridedCuVector{$eltyout}})
             if length(A) != length(x) || length(A) != length(y)
                 throw(DimensionMismatch("Lengths of inputs must be the same"))
             end
@@ -450,23 +611,35 @@ for (fname, fname_64, eltyin, eltyout) in (
 
             y
         end
+        function gemv_batched!(trans::Char,
+                               alpha::Number,
+                               A::Vector{<:StridedCuMatrix{$eltyin}},
+                               x::Vector{<:StridedCuVector{$eltyin}},
+                               beta::Number,
+                               y::Vector{<:StridedCuVector{$eltyout}})
+            gpu_α = CuRef{$eltyconst}( convert($eltyconst, alpha) )
+            gpu_β = CuRef{$eltyconst}( convert($eltyconst, beta) )
+            y = gemv_batched!(trans, gpu_α, A, x, gpu_β, y)
+            synchronize()
+            return y
+        end
     end
 end
 
-for (fname, fname_64, eltyin, eltyout) in (
-    (:cublasDgemvStridedBatched, :cublasDgemvStridedBatched_64, :Float64, :Float64),
-    (:cublasSgemvStridedBatched, :cublasSgemvStridedBatched_64, :Float32, :Float32),
-    (:cublasHSHgemvStridedBatched, :cublasHSHgemvStridedBatched, :Float16, :Float16),
-    (:cublasHSSgemvStridedBatched, :cublasHSSgemvStridedBatched, :Float16, :Float32),
-    (:cublasZgemvStridedBatched, :cublasZgemvStridedBatched_64, :ComplexF64, :ComplexF64),
-    (:cublasCgemvStridedBatched, :cublasCgemvStridedBatched_64, :ComplexF32, :ComplexF32))
+for (fname, fname_64, eltyin, eltyout, eltyconst) in (
+    (:cublasDgemvStridedBatched, :cublasDgemvStridedBatched_64, :Float64, :Float64, :Float64),
+    (:cublasSgemvStridedBatched, :cublasSgemvStridedBatched_64, :Float32, :Float32, :Float32),
+    (:cublasHSHgemvStridedBatched, :cublasHSHgemvStridedBatched, :Float16, :Float16, :Float32),
+    (:cublasHSSgemvStridedBatched, :cublasHSSgemvStridedBatched, :Float16, :Float32, :Float32),
+    (:cublasZgemvStridedBatched, :cublasZgemvStridedBatched_64, :ComplexF64, :ComplexF64, :ComplexF64),
+    (:cublasCgemvStridedBatched, :cublasCgemvStridedBatched_64, :ComplexF32, :ComplexF32, :ComplexF32))
     @eval begin
         function gemv_strided_batched!(trans::Char,
-                            alpha::Number,
-                            A::AbstractArray{$eltyin, 3},
-                            x::AbstractArray{$eltyin, 2},
-                            beta::Number,
-                            y::AbstractArray{$eltyout, 2})
+                                       alpha::CuRefArray{$eltyconst, CuVector{$eltyconst,  DeviceMemory}},
+                                       A::AbstractArray{$eltyin, 3},
+                                       x::AbstractArray{$eltyin, 2},
+                                       beta::CuRefArray{$eltyconst, CuVector{$eltyconst,  DeviceMemory}},
+                                       y::AbstractArray{$eltyout, 2})
             if size(A, 3) != size(x, 2) || size(A, 3) != size(y, 2)
                 throw(DimensionMismatch("Batch sizes must be equal for all inputs"))
             end
@@ -490,6 +663,18 @@ for (fname, fname_64, eltyin, eltyout) in (
             end
             y
         end
+        function gemv_strided_batched!(trans::Char,
+                                       alpha::Number,
+                                       A::AbstractArray{$eltyin, 3},
+                                       x::AbstractArray{$eltyin, 2},
+                                       beta::Number,
+                                       y::AbstractArray{$eltyout, 2})
+            gpu_α = CuRef{$eltyconst}( convert($eltyconst, alpha) )
+            gpu_β = CuRef{$eltyconst}( convert($eltyconst, beta) )
+            y = gemv_strided_batched!(trans, gpu_α, A, x, gpu_β, y)
+            synchronize()
+            return y
+        end
     end
 end
 
@@ -503,10 +688,10 @@ for (fname, fname_64, elty) in ((:cublasDgbmv_v2, :cublasDgbmv_v2_64, :Float64),
                        m::Integer,
                        kl::Integer,
                        ku::Integer,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
                        x::StridedCuVector{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        y::StridedCuVector{$elty})
             n = size(A,2)
             # check dimensions
@@ -522,7 +707,30 @@ for (fname, fname_64, elty) in ((:cublasDgbmv_v2, :cublasDgbmv_v2_64, :Float64),
             end
             y
         end
+        function gbmv!(trans::Char,
+                       m::Integer,
+                       kl::Integer,
+                       ku::Integer,
+                       alpha::Number,
+                       A::StridedCuMatrix{$elty},
+                       x::StridedCuVector{$elty},
+                       beta::Number,
+                       y::StridedCuVector{$elty})
+
+            gpu_α = CuRef{$elty}( convert($elty, alpha) )
+            gpu_β = CuRef{$elty}( convert($elty, beta) )
+            y = gbmv!(trans, m, kl, ku, gpu_α, A, x, gpu_β, y)
+            synchronize()
+            return y
+        end
     end
+end
+function gbmv(trans::Char, m::Integer, kl::Integer, ku::Integer, alpha::CuVector{T},
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    # TODO: fix gbmv bug in julia
+    n = size(A,2)
+    leny = trans == 'N' ? m : n
+    gbmv!(trans, m, kl, ku, alpha, A, x, CuRef(zero(T)), similar(x, leny))
 end
 function gbmv(trans::Char, m::Integer, kl::Integer, ku::Integer, alpha::Number,
               A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
@@ -541,10 +749,10 @@ for (fname, fname_64, elty) in ((:cublasDspmv_v2, :cublasDspmv_v2_64, :Float64),
                                 (:cublasSspmv_v2, :cublasSspmv_v2_64, :Float32))
     @eval begin
         function spmv!(uplo::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        AP::StridedCuVector{$elty},
                        x::StridedCuVector{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        y::StridedCuVector{$elty})
             n = round(Int, (sqrt(8*length(AP))-1)/2)
             if n != length(x) || n != length(y) throw(DimensionMismatch("")) end
@@ -558,6 +766,22 @@ for (fname, fname_64, elty) in ((:cublasDspmv_v2, :cublasDspmv_v2_64, :Float64),
             y
         end
     end
+end
+function spmv!(uplo::Char,
+               alpha::Number,
+               AP::StridedCuVector{T},
+               x::StridedCuVector{T},
+               beta::Number,
+               y::StridedCuVector{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    y = spmv!(uplo, gpu_α, AP, x, gpu_β, y)
+    synchronize()
+    return y
+end
+function spmv(uplo::Char, alpha::CuVector{T},
+              AP::StridedCuVector{T}, x::StridedCuVector{T}) where T
+    spmv!(uplo, alpha, AP, x, CuRef{T}(zero(T)), similar(x))
 end
 function spmv(uplo::Char, alpha::Number,
               AP::StridedCuVector{T}, x::StridedCuVector{T}) where T
@@ -575,10 +799,10 @@ for (fname, fname_64, elty) in ((:cublasDsymv_v2, :cublasDsymv_v2_64, :Float64),
     # Note that the complex symv are not BLAS but auiliary functions in LAPACK
     @eval begin
         function symv!(uplo::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
                        x::StridedCuVector{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        y::StridedCuVector{$elty})
             m, n = size(A)
             if m != n throw(DimensionMismatch("Matrix A is $m by $n but must be square")) end
@@ -595,6 +819,22 @@ for (fname, fname_64, elty) in ((:cublasDsymv_v2, :cublasDsymv_v2_64, :Float64),
         end
     end
 end
+function symv!(uplo::Char,
+               alpha::Number,
+               A::StridedCuMatrix{T},
+               x::StridedCuVector{T},
+               beta::Number,
+               y::StridedCuVector{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    y = symv!(uplo, gpu_α, A, x, gpu_β, y)
+    synchronize()
+    return y
+end
+function symv(uplo::Char, alpha::CuVector{T},
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    symv!(uplo, alpha, A, x, CuRef{T}(zero(T)), similar(x))
+end
 function symv(uplo::Char, alpha::Number,
               A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
         symv!(uplo, alpha, A, x, zero(T), similar(x))
@@ -609,10 +849,10 @@ for (fname, fname_64, elty) in ((:cublasZhemv_v2, :cublasZhemv_v2_64, :ComplexF6
                                 (:cublasChemv_v2, :cublasChemv_v2_64, :ComplexF32))
     @eval begin
         function hemv!(uplo::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
                        x::StridedCuVector{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        y::StridedCuVector{$elty})
             # TODO: fix dimension check bug in julia
             m, n = size(A)
@@ -629,6 +869,22 @@ for (fname, fname_64, elty) in ((:cublasZhemv_v2, :cublasZhemv_v2_64, :ComplexF6
             y
         end
     end
+end
+function hemv!(uplo::Char,
+               alpha::Number,
+               A::StridedCuMatrix{T},
+               x::StridedCuVector{T},
+               beta::Number,
+               y::StridedCuVector{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    y = hemv!(uplo, gpu_α, A, x, gpu_β, y)
+    synchronize()
+    return y
+end
+function hemv(uplo::Char, alpha::CuVector{T},
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    hemv!(uplo, alpha, A, x, CuRef{T}(zero(T)), similar(x))
 end
 function hemv(uplo::Char, alpha::Number, A::StridedCuMatrix{T},
               x::StridedCuVector{T}) where T
@@ -647,10 +903,10 @@ for (fname, fname_64, elty) in ((:cublasDsbmv_v2, :cublasDsbmv_v2_64, :Float64),
     @eval begin
         function sbmv!(uplo::Char,
                        k::Integer,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
                        x::StridedCuVector{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        y::StridedCuVector{$elty})
             m, n = size(A)
             #if m != n throw(DimensionMismatch("Matrix A is $m by $n but must be square")) end
@@ -669,6 +925,23 @@ for (fname, fname_64, elty) in ((:cublasDsbmv_v2, :cublasDsbmv_v2_64, :Float64),
         end
     end
 end
+function sbmv!(uplo::Char,
+               k::Integer,
+               alpha::Number,
+               A::StridedCuMatrix{T},
+               x::StridedCuVector{T},
+               beta::Number,
+               y::StridedCuVector{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    y = sbmv!(uplo, k, gpu_α, A, x, gpu_β, y)
+    synchronize()
+    return y
+end
+function sbmv(uplo::Char, k::Integer, alpha::CuVector{T},
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    sbmv!(uplo, k, alpha, A, x, CuRef{T}(zero(T)), similar(x))
+end
 function sbmv(uplo::Char, k::Integer, alpha::Number,
               A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
     n = size(A,2)
@@ -685,10 +958,10 @@ for (fname, fname_64, elty) in ((:cublasZhbmv_v2, :cublasZhbmv_v2_64, :ComplexF6
     @eval begin
         function hbmv!(uplo::Char,
                        k::Integer,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
                        x::StridedCuVector{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        y::StridedCuVector{$elty})
             m, n = size(A)
             if !(1<=(1+k)<=n) throw(DimensionMismatch("Incorrect number of bands")) end
@@ -705,6 +978,23 @@ for (fname, fname_64, elty) in ((:cublasZhbmv_v2, :cublasZhbmv_v2_64, :ComplexF6
             y
         end
     end
+end
+function hbmv!(uplo::Char,
+               k::Integer,
+               alpha::Number,
+               A::StridedCuMatrix{T},
+               x::StridedCuVector{T},
+               beta::Number,
+               y::StridedCuVector{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    y = hbmv!(uplo, k, gpu_α, A, x, gpu_β, y)
+    synchronize()
+    return y
+end
+function hbmv(uplo::Char, k::Integer, alpha::CuVector{T},
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    hbmv!(uplo, k, alpha, A, x, CuRef{T}(zero(T)), similar(x))
 end
 function hbmv(uplo::Char, k::Integer, alpha::Number,
               A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
@@ -850,7 +1140,7 @@ for (fname, fname_64, elty) in ((:cublasDger_v2, :cublasDger_v2_64, :Float64),
                                 (:cublasZgerc_v2, :cublasZgerc_v2_64, :ComplexF64),
                                 (:cublasCgerc_v2, :cublasCgerc_v2_64, :ComplexF32))
     @eval begin
-        function ger!(alpha::Number,
+        function ger!(alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                       x::StridedCuVector{$elty},
                       y::StridedCuVector{$elty},
                       A::StridedCuMatrix{$elty})
@@ -869,13 +1159,22 @@ for (fname, fname_64, elty) in ((:cublasDger_v2, :cublasDger_v2_64, :Float64),
         end
     end
 end
+function ger!(alpha::Number,
+              x::StridedCuVector{T},
+              y::StridedCuVector{T},
+              A::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    A = ger!(gpu_α, x, y, A)
+    synchronize()
+    return A
+end
 
 ### spr
 for (fname, fname_64, elty) in ((:cublasDspr_v2, :cublasDspr_v2_64, :Float64),
                                 (:cublasSspr_v2, :cublasSspr_v2_64, :Float32))
     @eval begin
         function spr!(uplo::Char,
-                      alpha::Number,
+                      alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                       x::StridedCuVector{$elty},
                       AP::StridedCuVector{$elty})
             n = round(Int, (sqrt(8*length(AP))-1)/2)
@@ -890,6 +1189,14 @@ for (fname, fname_64, elty) in ((:cublasDspr_v2, :cublasDspr_v2_64, :Float64),
         end
     end
 end
+function spr!(alpha::Number,
+              x::StridedCuVector{T},
+              AP::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    AP = spr!(gpu_α, x, AP)
+    synchronize()
+    return AP
+end
 
 ### syr
 # TODO: check calls in julia b/c blas may not define syr for Z and C
@@ -899,7 +1206,7 @@ for (fname, fname_64, elty) in ((:cublasDsyr_v2, :cublasDsyr_v2_64, :Float64),
                                 (:cublasCsyr_v2, :cublasCsyr_v2_64, :ComplexF32))
     @eval begin
         function syr!(uplo::Char,
-                      alpha::Number,
+                      alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                       x::StridedCuVector{$elty},
                       A::StridedCuMatrix{$elty})
             m, n = size(A)
@@ -916,13 +1223,22 @@ for (fname, fname_64, elty) in ((:cublasDsyr_v2, :cublasDsyr_v2_64, :Float64),
         end
     end
 end
+function syr!(uplo::Char,
+              alpha::Number,
+              x::StridedCuVector{T},
+              A::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    A = syr!(uplo, gpu_α, x, A)
+    synchronize()
+    return A
+end
 
 ### her
-for (fname, fname_64, elty) in ((:cublasZher_v2, :cublasZher_v2_64, :ComplexF64),
-                                (:cublasCher_v2, :cublasCher_v2_64, :ComplexF32))
+for (fname, fname_64, elty, relty) in ((:cublasZher_v2, :cublasZher_v2_64, :ComplexF64, :Float64),
+                                       (:cublasCher_v2, :cublasCher_v2_64, :ComplexF32, :Float32))
     @eval begin
         function her!(uplo::Char,
-                      alpha::Number,
+                      alpha::CuRefArray{$relty, CuVector{$relty,  DeviceMemory}},
                       x::StridedCuVector{$elty},
                       A::StridedCuMatrix{$elty})
             m, n = size(A)
@@ -938,6 +1254,15 @@ for (fname, fname_64, elty) in ((:cublasZher_v2, :cublasZher_v2_64, :ComplexF64)
             A
         end
     end
+end
+function her!(uplo::Char,
+              alpha::Number,
+              x::StridedCuVector{T},
+              A::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef( convert(real(T), alpha) )
+    A = her!(uplo, gpu_α, x, A)
+    synchronize()
+    return A
 end
 
 ### her2
@@ -945,10 +1270,10 @@ for (fname, fname_64, elty) in ((:cublasZher2_v2, :cublasZher2_v2_64, :ComplexF6
                                 (:cublasCher2_v2, :cublasCher2_v2_64, :ComplexF32))
     @eval begin
         function her2!(uplo::Char,
-                      alpha::Number,
-                      x::StridedCuVector{$elty},
-                      y::StridedCuVector{$elty},
-                      A::StridedCuMatrix{$elty})
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
+                       x::StridedCuVector{$elty},
+                       y::StridedCuVector{$elty},
+                       A::StridedCuMatrix{$elty})
             m, n = size(A)
             m == n || throw(DimensionMismatch("Matrix A is $m by $n but must be square"))
             length(x) == n || throw(DimensionMismatch("Length of vector must be the same as the matrix dimensions"))
@@ -965,21 +1290,31 @@ for (fname, fname_64, elty) in ((:cublasZher2_v2, :cublasZher2_v2_64, :ComplexF6
         end
     end
 end
+function her2!(uplo::Char,
+               alpha::Number,
+               x::StridedCuVector{T},
+               y::StridedCuVector{T},
+               A::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    A = her2!(uplo, gpu_α, x, y, A)
+    synchronize()
+    return A
+end
 
 # Level 3
 ## (GE) general matrix-matrix multiplication
 for (fname, fname_64, elty) in ((:cublasDgemm_v2, :cublasDgemm_v2_64, :Float64),
                                 (:cublasSgemm_v2, :cublasSgemm_v2_64, :Float32),
-                                (:cublasHgemm, :cublasHgemm, :Float16),
+                                (:cublasHgemm,    :cublasHgemm,       :Float16),
                                 (:cublasZgemm_v2, :cublasZgemm_v2_64, :ComplexF64),
                                 (:cublasCgemm_v2, :cublasCgemm_v2_64, :ComplexF32))
     @eval begin
         function gemm!(transA::Char,
                        transB::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuVecOrMat{$elty},
                        B::StridedCuVecOrMat{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        C::StridedCuVecOrMat{$elty})
             m = size(A, transA == 'N' ? 1 : 2)
             k = size(A, transA == 'N' ? 2 : 1)
@@ -998,6 +1333,25 @@ for (fname, fname_64, elty) in ((:cublasDgemm_v2, :cublasDgemm_v2_64, :Float64),
             C
         end
     end
+end
+function gemm!(transA::Char,
+               transB::Char,
+               alpha::Number,
+               A::StridedCuVecOrMat{T},
+               B::StridedCuVecOrMat{T},
+               beta::Number,
+               C::StridedCuVecOrMat{T}) where {T}
+    gpu_α = CuRef{T}(convert(T, alpha))
+    gpu_β = CuRef{T}(convert(T, beta))
+    C = gemm!(transA, transB, gpu_α, A, B, gpu_β, C)
+    synchronize()
+    return C
+end
+function gemm(transA::Char, transB::Char, alpha::CuVector{T},
+              A::StridedCuVecOrMat{T}, B::StridedCuVecOrMat{T}) where T
+    gemm!(transA, transB, alpha, A, B, CuRef(zero(T)),
+          similar(B, (size(A, transA == 'N' ? 1 : 2),
+                      size(B, transB == 'N' ? 2 : 1))))
 end
 function gemm(transA::Char, transB::Char, alpha::Number,
               A::StridedCuVecOrMat{T}, B::StridedCuVecOrMat{T}) where T
@@ -1088,10 +1442,10 @@ function gemmExComputeType(TA, TB, TC, m, k, n)
 end
 
 function gemmEx!(transA::Char, transB::Char,
-                 @nospecialize(alpha::Number),
+                 @nospecialize(alpha::CuRefArray),
                  @nospecialize(A::StridedCuVecOrMat),
                  @nospecialize(B::StridedCuVecOrMat),
-                 @nospecialize(beta::Number),
+                 @nospecialize(beta::CuRefArray),
                  @nospecialize(C::StridedCuVecOrMat);
                  algo::cublasGemmAlgo_t=CUBLAS_GEMM_DEFAULT)
     m = size(A, transA == 'N' ? 1 : 2)
@@ -1109,22 +1463,41 @@ function gemmEx!(transA::Char, transB::Char,
     computeT = juliaStorageType(eltype(C), computeType)
     if version() >= v"11.0"
         # with CUDA 11, the compute type encodes the math mode.
-        cublasGemmEx(handle(), transA, transB, m, n, k, Ref{computeT}(alpha), A, eltype(A), lda, B,
-                    eltype(B), ldb, Ref{computeT}(beta), C, eltype(C), ldc, computeType, algo)
+        cublasGemmEx(handle(), transA, transB, m, n, k, alpha, A, eltype(A), lda, B,
+                    eltype(B), ldb, beta, C, eltype(C), ldc, computeType, algo)
     else
         # before CUDA 11, it was a plain cudaDataType.
         computeType = convert(cudaDataType, computeT)
-        cublasGemmEx_old(handle(), transA, transB, m, n, k, Ref{computeT}(alpha), A, eltype(A), lda, B,
-                    eltype(B), ldb, Ref{computeT}(beta), C, eltype(C), ldc, computeType, algo)
+        cublasGemmEx_old(handle(), transA, transB, m, n, k, alpha, A, eltype(A), lda, B,
+                    eltype(B), ldb, beta, C, eltype(C), ldc, computeType, algo)
     end
     C
 end
-
-function gemmBatchedEx!(transA::Char, transB::Char,
+function gemmEx!(transA::Char, transB::Char,
                  @nospecialize(alpha::Number),
+                 @nospecialize(A::StridedCuVecOrMat),
+                 @nospecialize(B::StridedCuVecOrMat),
+                 @nospecialize(beta::Number),
+                 @nospecialize(C::StridedCuVecOrMat);
+                 algo::cublasGemmAlgo_t=CUBLAS_GEMM_DEFAULT)
+    m = size(A, transA == 'N' ? 1 : 2)
+    k = size(A, transA == 'N' ? 2 : 1)
+    n = size(B, transB == 'N' ? 2 : 1)
+    computeType = gemmExComputeType(eltype(A), eltype(B), eltype(C), m, k, n)
+    computeT = juliaStorageType(eltype(C), computeType)
+    gpu_α = CuRef{computeT}(convert(computeT, alpha))
+    gpu_β = CuRef{computeT}(convert(computeT, beta))
+    C = gemmEx!(transA, transB, gpu_α, A, B, gpu_β, C; algo=algo)
+    synchronize()
+    return C
+end
+
+# TODO for device mode pointers
+function gemmBatchedEx!(transA::Char, transB::Char,
+                 @nospecialize(alpha::CuRefArray),
                  @nospecialize(A::Vector{<:StridedCuVecOrMat}),
                  @nospecialize(B::Vector{<:StridedCuVecOrMat}),
-                 @nospecialize(beta::Number),
+                 @nospecialize(beta::CuRefArray),
                  @nospecialize(C::Vector{<:StridedCuVecOrMat});
                  algo::cublasGemmAlgo_t=CUBLAS_GEMM_DEFAULT)
     if length(A) != length(B) || length(A) != length(C)
@@ -1153,8 +1526,8 @@ function gemmBatchedEx!(transA::Char, transB::Char,
     Cptrs = unsafe_batch(C)
     if version() >= v"11.0"
         # with CUDA 11, the compute type encodes the math mode.
-        cublasGemmBatchedEx(handle(), transA, transB, m, n, k, Ref{computeT}(alpha), Aptrs, eltype(A[1]), lda, Bptrs,
-                            eltype(B[1]), ldb, Ref{computeT}(beta), Cptrs, eltype(C[1]), ldc, length(A), computeType, algo)
+        cublasGemmBatchedEx(handle(), transA, transB, m, n, k, alpha, Aptrs, eltype(A[1]), lda, Bptrs,
+                            eltype(B[1]), ldb, beta, Cptrs, eltype(C[1]), ldc, length(A), computeType, algo)
     else
         error("Not implemented for CUDA 11 and below.")
     end
@@ -1165,11 +1538,33 @@ function gemmBatchedEx!(transA::Char, transB::Char,
     C
 end
 
-function gemmStridedBatchedEx!(transA::Char, transB::Char,
+function gemmBatchedEx!(transA::Char, transB::Char,
                  @nospecialize(alpha::Number),
+                 @nospecialize(A::Vector{<:StridedCuVecOrMat}),
+                 @nospecialize(B::Vector{<:StridedCuVecOrMat}),
+                 @nospecialize(beta::Number),
+                 @nospecialize(C::Vector{<:StridedCuVecOrMat});
+                 algo::cublasGemmAlgo_t=CUBLAS_GEMM_DEFAULT)
+
+    m = size(A[1], transA == 'N' ? 1 : 2)
+    k = size(A[1], transA == 'N' ? 2 : 1)
+    n = size(B[1], transB == 'N' ? 2 : 1)
+    computeType = gemmExComputeType(eltype(A[1]), eltype(B[1]), eltype(C[1]), m, k, n)
+    isnothing(computeType) &&
+    throw(ArgumentError("gemmEx does not support $(eltype(C))=$(eltype(A))*$(eltype(B))"))
+    computeT = juliaStorageType(eltype(C[1]), computeType)
+    gpu_α = CuRef{computeT}(convert(computeT, alpha))
+    gpu_β = CuRef{computeT}(convert(computeT, beta))
+    C = gemmBatchedEx!(transA, transB, gpu_α, A, B, gpu_β, C; algo=algo)
+    synchronize()
+    return C
+end
+
+function gemmStridedBatchedEx!(transA::Char, transB::Char,
+                 @nospecialize(alpha::CuRefArray),
                  @nospecialize(A::AbstractArray{Ta, 3}),
                  @nospecialize(B::AbstractArray{Tb, 3}),
-                 @nospecialize(beta::Number),
+                 @nospecialize(beta::CuRefArray),
                  @nospecialize(C::AbstractArray{Tc, 3});
                  algo::cublasGemmAlgo_t=CUBLAS_GEMM_DEFAULT) where {Ta, Tb, Tc}
     if size(A, 3) != size(B, 3) || size(A, 3) != size(C, 3)
@@ -1196,8 +1591,8 @@ function gemmStridedBatchedEx!(transA::Char, transB::Char,
     computeT = juliaStorageType(eltype(C), computeType)
     if version() >= v"11.0"
         # with CUDA 11, the compute type encodes the math mode.
-        cublasGemmStridedBatchedEx(handle(), transA, transB, m, n, k, Ref{computeT}(alpha), A, eltype(A), lda, strideA,
-                                   B, eltype(B), ldb, strideB, Ref{computeT}(beta), C, eltype(C), ldc, strideC,
+        cublasGemmStridedBatchedEx(handle(), transA, transB, m, n, k, alpha, A, eltype(A), lda, strideA,
+                                   B, eltype(B), ldb, strideB, beta, C, eltype(C), ldc, strideC,
                                    batchCount, computeType, algo)
     else
         error("Not implemented for CUDA 11 and below.")
@@ -1205,6 +1600,26 @@ function gemmStridedBatchedEx!(transA::Char, transB::Char,
     C
 end
 
+function gemmStridedBatchedEx!(transA::Char, transB::Char,
+                 @nospecialize(alpha::Number),
+                 @nospecialize(A::AbstractArray{Ta, 3}),
+                 @nospecialize(B::AbstractArray{Tb, 3}),
+                 @nospecialize(beta::Number),
+                 @nospecialize(C::AbstractArray{Tc, 3});
+                 algo::cublasGemmAlgo_t=CUBLAS_GEMM_DEFAULT) where {Ta, Tb, Tc}
+    m = size(A, transA == 'N' ? 1 : 2)
+    k = size(A, transA == 'N' ? 2 : 1)
+    n = size(B, transB == 'N' ? 2 : 1)
+    computeType = gemmExComputeType(eltype(A), eltype(B), eltype(C), m, k, n)
+    isnothing(computeType) &&
+    throw(ArgumentError("gemmEx does not support $(eltype(C))=$(eltype(A))*$(eltype(B))"))
+    computeT = juliaStorageType(eltype(C), computeType)
+    gpu_α = CuRef{computeT}(convert(computeT, alpha))
+    gpu_β = CuRef{computeT}(convert(computeT, beta))
+    C = gemmStridedBatchedEx!(transA, transB, gpu_α, A, B, gpu_β, C; algo=algo)
+    synchronize()
+    return C
+end
 # create a batch of pointers in device memory from a batch of device arrays
 @inline function unsafe_batch(batch::Vector{<:CuArray{T}}) where {T}
     ptrs = pointer.(batch)
@@ -1379,16 +1794,16 @@ end
 ## (GE) general matrix-matrix multiplication batched
 for (fname, fname_64, elty) in ((:cublasDgemmBatched, :cublasDgemmBatched_64, :Float64),
                                 (:cublasSgemmBatched, :cublasSgemmBatched_64, :Float32),
-                                (:cublasHgemmBatched, :cublasHgemmBatched, :Float16),
+                                (:cublasHgemmBatched, :cublasHgemmBatched,    :Float16),
                                 (:cublasZgemmBatched, :cublasZgemmBatched_64, :ComplexF64),
                                 (:cublasCgemmBatched, :cublasCgemmBatched_64, :ComplexF32))
     @eval begin
         function gemm_batched!(transA::Char,
                                transB::Char,
-                               alpha::Number,
+                               alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                                A::Vector{<:StridedCuMatrix{$elty}},
                                B::Vector{<:StridedCuMatrix{$elty}},
-                               beta::Number,
+                               beta::CuRefArray{$elty, CuVector{$elty, DeviceMemory}},
                                C::Vector{<:StridedCuMatrix{$elty}})
             if length(A) != length(B) || length(A) != length(C)
                 throw(DimensionMismatch(""))
@@ -1427,6 +1842,24 @@ for (fname, fname_64, elty) in ((:cublasDgemmBatched, :cublasDgemmBatched_64, :F
     end
 end
 
+function gemm_batched!(transA::Char,
+                       transB::Char,
+                       alpha::Number,
+                       A::Vector{<:StridedCuMatrix{T}},
+                       B::Vector{<:StridedCuMatrix{T}},
+                       beta::Number,
+                       C::Vector{<:StridedCuMatrix{T}}) where {T}
+    gpu_α = CuRef( convert(T, alpha) )
+    gpu_β = CuRef( convert(T, beta) )
+    C = gemm_batched!(transA, transB, gpu_α, A, B, gpu_β, C)
+    synchronize()
+    return C
+end
+function gemm_batched(transA::Char, transB::Char, alpha::CuVector{T},
+                      A::Vector{<:StridedCuMatrix{T}}, B::Vector{<:StridedCuMatrix{T}}) where T
+    C = CuMatrix{T}[similar(B[1], (size(A[1], transA == 'N' ? 1 : 2),size(B[1], transB == 'N' ? 2 : 1))) for i in 1:length(A)]
+    gemm_batched!(transA, transB, alpha, A, B, CuRef{T}(zero(T)), C )
+end
 function gemm_batched(transA::Char, transB::Char, alpha::Number,
                       A::Vector{<:StridedCuMatrix{T}}, B::Vector{<:StridedCuMatrix{T}}) where T
     C = CuMatrix{T}[similar(B[1], (size(A[1], transA == 'N' ? 1 : 2),size(B[1], transB == 'N' ? 2 : 1))) for i in 1:length(A)]
@@ -1440,16 +1873,16 @@ end
 ## (GE) general matrix-matrix multiplication strided batched
 for (fname, fname_64, elty) in ((:cublasDgemmStridedBatched, :cublasDgemmStridedBatched_64, :Float64),
                                 (:cublasSgemmStridedBatched, :cublasSgemmStridedBatched_64, :Float32),
-                                (:cublasHgemmStridedBatched, :cublasHgemmStridedBatched, :Float16),
+                                (:cublasHgemmStridedBatched, :cublasHgemmStridedBatched,    :Float16),
                                 (:cublasZgemmStridedBatched, :cublasZgemmStridedBatched_64, :ComplexF64),
                                 (:cublasCgemmStridedBatched, :cublasCgemmStridedBatched_64, :ComplexF32))
     @eval begin
         function gemm_strided_batched!(transA::Char,
                                transB::Char,
-                               alpha::Number,
+                               alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                                A::AbstractArray{$elty, 3}, # allow PermutedDimsArray
                                B::AbstractArray{$elty, 3},
-                               beta::Number,
+                               beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                                C::AbstractArray{$elty, 3})
            m = size(A, transA == 'N' ? 1 : 2)
            k = size(A, transA == 'N' ? 2 : 1)
@@ -1480,6 +1913,26 @@ for (fname, fname_64, elty) in ((:cublasDgemmStridedBatched, :cublasDgemmStrided
         end
     end
 end
+function gemm_strided_batched!(transA::Char,
+                               transB::Char,
+                               alpha::Number,
+                               A::AbstractArray{T, 3},
+                               B::AbstractArray{T, 3},
+                               beta::Number,
+                               C::AbstractArray{T, 3}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    C = gemm_strided_batched!(transA, transB, gpu_α, A, B, gpu_β, C)
+    synchronize()
+    return C
+end
+function gemm_strided_batched(transA::Char, transB::Char, alpha::CuVector{T},
+                              A::AbstractArray{T, 3}, B::AbstractArray{T, 3}) where T
+    C = similar(B, (size(A, transA == 'N' ? 1 : 2),
+                    size(B, transB == 'N' ? 2 : 1),
+                    max(size(A, 3), size(B, 3))))
+    gemm_strided_batched!(transA, transB, alpha, A, B, CuRef{T}(zero(T)), C )
+end
 function gemm_strided_batched(transA::Char, transB::Char, alpha::Number,
                               A::AbstractArray{T, 3}, B::AbstractArray{T, 3}) where T
     C = similar(B, (size(A, transA == 'N' ? 1 : 2),
@@ -1501,10 +1954,10 @@ for (fname, fname_64, elty) in ((:cublasDsymm_v2, :cublasDsymm_v2_64, :Float64),
     @eval begin
         function symm!(side::Char,
                        uplo::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
                        B::StridedCuMatrix{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        C::StridedCuMatrix{$elty})
             k, nA = size(A)
             if k != nA throw(DimensionMismatch("Matrix A must be square")) end
@@ -1525,6 +1978,23 @@ for (fname, fname_64, elty) in ((:cublasDsymm_v2, :cublasDsymm_v2_64, :Float64),
         end
     end
 end
+function symm!(side::Char,
+               uplo::Char,
+               alpha::Number,
+               A::StridedCuMatrix{T},
+               B::StridedCuMatrix{T},
+               beta::Number,
+               C::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    C = symm!(side, uplo, gpu_α, A, B, gpu_β, C)
+    synchronize()
+    return C
+end
+function symm(side::Char, uplo::Char, alpha::CuVector{T},
+              A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
+    symm!(side, uplo, alpha, A, B, CuRef{T}(zero(T)), similar(B))
+end
 function symm(side::Char, uplo::Char, alpha::Number,
               A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
     symm!(side, uplo, alpha, A, B, zero(T), similar(B))
@@ -1542,9 +2012,9 @@ for (fname, fname_64, elty) in ((:cublasDsyrk_v2, :cublasDsyrk_v2_64, :Float64),
     @eval begin
         function syrk!(uplo::Char,
                        trans::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuVecOrMat{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        C::StridedCuMatrix{$elty})
             mC, n = size(C)
             if mC != n throw(DimensionMismatch("C must be square")) end
@@ -1562,6 +2032,22 @@ for (fname, fname_64, elty) in ((:cublasDsyrk_v2, :cublasDsyrk_v2_64, :Float64),
         end
     end
 end
+function syrk!(uplo::Char,
+               trans::Char,
+               alpha::Number,
+               A::StridedCuVecOrMat{T},
+               beta::Number,
+               C::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    C = syrk!(uplo, trans, gpu_α, A, gpu_β, C)
+    synchronize()
+    return C
+end
+function syrk(uplo::Char, trans::Char, alpha::CuRefArray{T, CuVector{T, DeviceMemory}}, A::StridedCuVecOrMat{T}) where T
+    n = size(A, trans == 'N' ? 1 : 2)
+    syrk!(uplo, trans, alpha, A, CuRef{T}(zero(T)), similar(A, (n, n)))
+end
 function syrk(uplo::Char, trans::Char, alpha::Number, A::StridedCuVecOrMat{T}) where T
     n = size(A, trans == 'N' ? 1 : 2)
     syrk!(uplo, trans, alpha, A, zero(T), similar(A, (n, n)))
@@ -1577,10 +2063,10 @@ for (fname, fname_64, elty) in ((:cublasDsyrkx, :cublasDsyrkx_64, :Float64),
     @eval begin
         function syrkx!(uplo::Char,
                        trans::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuVecOrMat{$elty},
                        B::StridedCuVecOrMat{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        C::StridedCuMatrix{$elty})
             mC, n = size(C)
             if mC != n throw(DimensionMismatch("C must be square")) end
@@ -1599,6 +2085,24 @@ for (fname, fname_64, elty) in ((:cublasDsyrkx, :cublasDsyrkx_64, :Float64),
         end
     end
 end
+function syrkx!(uplo::Char,
+                trans::Char,
+                alpha::Number,
+                A::StridedCuVecOrMat{T},
+                B::StridedCuVecOrMat{T},
+                beta::Number,
+                C::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    C = syrkx!(uplo, trans, gpu_α, A, B, gpu_β, C)
+    synchronize()
+    return C
+end
+function syrkx(uplo::Char, trans::Char, alpha::CuRefArray{T, CuVector{T,  DeviceMemory}}, A::StridedCuVecOrMat{T},
+               beta::CuRefArray{T, CuVector{T,  DeviceMemory}}, B::StridedCuVecOrMat{T}) where T
+    n = size(A, trans == 'N' ? 1 : 2)
+    syrkx!(uplo, trans, alpha, A, B, beta, similar(A, (n, n)))
+end
 function syrkx(uplo::Char, trans::Char, alpha::Number, A::StridedCuVecOrMat{T},
                 beta::Number, B::StridedCuVecOrMat{T}) where T
     n = size(A, trans == 'N' ? 1 : 2)
@@ -1614,10 +2118,10 @@ for (fname, fname_64, elty) in ((:cublasZhemm_v2, :cublasZhemm_v2_64, :ComplexF6
     @eval begin
         function hemm!(side::Char,
                        uplo::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
                        B::StridedCuMatrix{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        C::StridedCuMatrix{$elty})
             mA, nA = size(A)
             m, n = size(B)
@@ -1638,6 +2142,24 @@ for (fname, fname_64, elty) in ((:cublasZhemm_v2, :cublasZhemm_v2_64, :ComplexF6
         end
     end
 end
+function hemm!(side::Char,
+               uplo::Char,
+               alpha::Number,
+               A::StridedCuMatrix{T},
+               B::StridedCuMatrix{T},
+               beta::Number,
+               C::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    C = hemm!(side, uplo, gpu_α, A, B, gpu_β, C)
+    synchronize()
+    return C
+end
+function hemm(uplo::Char, trans::Char, alpha::CuRefArray{T, CuVector{T,  DeviceMemory}},
+              A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
+    m,n = size(B)
+    hemm!( uplo, trans, alpha, A, B, CuRef{T}(zero(T)), similar(B, (m,n) ) )
+end
 function hemm(uplo::Char, trans::Char, alpha::Number,
               A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
     m,n = size(B)
@@ -1648,14 +2170,14 @@ function hemm(uplo::Char, trans::Char, A::StridedCuMatrix{T}, B::StridedCuMatrix
 end
 
 ## herk
-for (fname, fname_64, elty) in ((:cublasZherk_v2, :cublasZherk_v2_64, :ComplexF64),
-                                (:cublasCherk_v2, :cublasCherk_v2_64, :ComplexF32))
+for (fname, fname_64, elty, relty) in ((:cublasZherk_v2, :cublasZherk_v2_64, :ComplexF64, :Float64),
+                                       (:cublasCherk_v2, :cublasCherk_v2_64, :ComplexF32, :Float32))
     @eval begin
         function herk!(uplo::Char,
                        trans::Char,
-                       alpha::Real,
+                       alpha::CuRefArray{$relty, CuVector{$relty,  DeviceMemory}},
                        A::StridedCuVecOrMat{$elty},
-                       beta::Real,
+                       beta::CuRefArray{$relty, CuVector{$relty,  DeviceMemory}},
                        C::StridedCuMatrix{$elty})
             mC, n = size(C)
             if mC != n throw(DimensionMismatch("C must be square")) end
@@ -1670,6 +2192,25 @@ for (fname, fname_64, elty) in ((:cublasZherk_v2, :cublasZherk_v2_64, :ComplexF6
                 $fname(handle(), uplo, trans, n, k, alpha, A, lda, beta, C, ldc)
             end
             C
+        end
+        function herk!(uplo::Char,
+                       trans::Char,
+                       alpha::Real,
+                       A::StridedCuVecOrMat{$elty},
+                       beta::Real,
+                       C::StridedCuMatrix{$elty})
+            gpu_α = CuRef{$relty}( convert($relty, alpha) )
+            gpu_β = CuRef{$relty}( convert($relty, beta) )
+            C = herk!(uplo, trans, gpu_α, A, gpu_β, C)
+            synchronize()
+            return C
+        end
+        function herk(uplo::Char,
+                      trans::Char,
+                      alpha::CuRefArray{$relty, CuVector{$relty,  DeviceMemory}},
+                      A::StridedCuVecOrMat{$elty})
+            n = size(A, trans == 'N' ? 1 : 2)
+            herk!(uplo, trans, alpha, A, CuRef{$relty}(zero($relty)), similar(A, (n,n)))
         end
    end
 end
@@ -1689,10 +2230,10 @@ for (fname, fname_64, elty) in ((:cublasDsyr2k_v2, :cublasDsyr2k_v2_64, :Float64
     @eval begin
         function syr2k!(uplo::Char,
                         trans::Char,
-                        alpha::Number,
+                        alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                         A::StridedCuVecOrMat{$elty},
                         B::StridedCuVecOrMat{$elty},
-                        beta::Number,
+                        beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                         C::StridedCuMatrix{$elty})
             # TODO: check size of B in julia (syr2k!)
             m, n = size(C)
@@ -1716,6 +2257,27 @@ for (fname, fname_64, elty) in ((:cublasDsyr2k_v2, :cublasDsyr2k_v2_64, :Float64
         end
     end
 end
+function syr2k!(uplo::Char,
+                trans::Char,
+                alpha::Number,
+                A::StridedCuVecOrMat{T},
+                B::StridedCuVecOrMat{T},
+                beta::Number,
+                C::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    C = syr2k!(uplo, trans, gpu_α, A, B, gpu_β, C)
+    synchronize()
+    return C
+end
+function syr2k(uplo::Char,
+               trans::Char,
+               alpha::CuRefArray{T, CuVector{T,  DeviceMemory}},
+               A::StridedCuVecOrMat{T},
+               B::StridedCuVecOrMat{T}) where {T}
+    n = size(A, trans == 'N' ? 1 : 2)
+    syr2k!(uplo, trans, convert(T,alpha), A, B, CuRef{T}(zero(T)), similar(A, T, (n, n)))
+end
 function syr2k(uplo::Char,
                trans::Char,
                alpha::Number,
@@ -1730,15 +2292,15 @@ function syr2k(uplo::Char, trans::Char, A::StridedCuVecOrMat, B::StridedCuVecOrM
 end
 
 ## her2k
-for (fname, fname_64, elty) in ((:cublasZher2k_v2, :cublasZher2k_v2_64, :ComplexF64),
-                                (:cublasCher2k_v2, :cublasCher2k_v2_64, :ComplexF32))
+for (fname, fname_64, elty, relty) in ((:cublasZher2k_v2, :cublasZher2k_v2_64, :ComplexF64, :Float64),
+                                       (:cublasCher2k_v2, :cublasCher2k_v2_64, :ComplexF32, :Float32))
     @eval begin
         function her2k!(uplo::Char,
                         trans::Char,
-                        alpha::Number,
+                        alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                         A::StridedCuVecOrMat{$elty},
                         B::StridedCuVecOrMat{$elty},
-                        beta::Real,
+                        beta::CuRefArray{$relty, CuVector{$relty,  DeviceMemory}},
                         C::StridedCuMatrix{$elty})
             # TODO: check size of B in julia (her2k!)
             m, n = size(C)
@@ -1760,6 +2322,28 @@ for (fname, fname_64, elty) in ((:cublasZher2k_v2, :cublasZher2k_v2_64, :Complex
                 $fname(handle(), uplo, trans, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
             end
             C
+        end
+        function her2k!(uplo::Char,
+                        trans::Char,
+                        alpha::Complex,
+                        A::StridedCuVecOrMat{$elty},
+                        B::StridedCuVecOrMat{$elty},
+                        beta::Real,
+                        C::StridedCuMatrix{$elty})
+            gpu_α = CuRef{$elty}( convert($elty, alpha) )
+            gpu_β = CuRef{$relty}( convert($relty, beta) )
+            C = her2k!(uplo, trans, gpu_α, A, B, gpu_β, C)
+            synchronize()
+            return C
+        end
+        function her2k!(uplo::Char,
+                        trans::Char,
+                        alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
+                        A::StridedCuVecOrMat{$elty},
+                        B::StridedCuVecOrMat{$elty},
+                        )
+            n = size(A, trans == 'N' ? 1 : 2)
+            her2k!(uplo, trans, alpha, A, B, CuRef{$relty}(zero($relty)), similar(A, (n,n)))
         end
    end
 end
@@ -1787,7 +2371,7 @@ for (mmname, smname, elty) in
                        uplo::Char,
                        transa::Char,
                        diag::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
                        B::StridedCuMatrix{$elty},
                        C::StridedCuMatrix{$elty})
@@ -1809,7 +2393,7 @@ for (mmname, smname, elty) in
                        uplo::Char,
                        transa::Char,
                        diag::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
                        B::StridedCuMatrix{$elty})
             m, n = size(B)
@@ -1824,11 +2408,36 @@ for (mmname, smname, elty) in
         end
     end
 end
-function trmm(side::Char, uplo::Char, transa::Char, diag::Char, alpha::Number,
+function trmm!(side::Char,
+               uplo::Char,
+               transa::Char,
+               diag::Char,
+               alpha::Number,
+               A::StridedCuMatrix{T},
+               B::StridedCuMatrix{T},
+               C::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    C = trmm!(side, uplo, transa, diag, gpu_α, A, B, C)
+    synchronize()
+    return C
+end
+function trsm!(side::Char,
+               uplo::Char,
+               transa::Char,
+               diag::Char,
+               alpha::Number,
+               A::StridedCuMatrix{T},
+               B::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    B = trsm!(side, uplo, transa, diag, gpu_α, A, B)
+    synchronize()
+    return B
+end
+function trmm(side::Char, uplo::Char, transa::Char, diag::Char, alpha::Union{CuRefArray, Number},
               A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
     trmm!(side, uplo, transa, diag, alpha, A, B, similar(B))
 end
-function trsm(side::Char, uplo::Char, transa::Char, diag::Char,alpha::Number,
+function trsm(side::Char, uplo::Char, transa::Char, diag::Char, alpha::Union{CuRefArray, Number},
               A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
     trsm!(side, uplo, transa, diag, alpha, A, copy(B))
 end
@@ -1843,7 +2452,7 @@ for (fname, fname_64, elty) in ((:cublasDtrsmBatched, :cublasDtrsmBatched_64, :F
                                uplo::Char,
                                transa::Char,
                                diag::Char,
-                               alpha::Number,
+                               alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                                A::Vector{<:StridedCuMatrix{$elty}},
                                B::Vector{<:StridedCuMatrix{$elty}})
             if length(A) != length(B)
@@ -1873,6 +2482,13 @@ for (fname, fname_64, elty) in ((:cublasDtrsmBatched, :cublasDtrsmBatched_64, :F
         end
     end
 end
+function trsm_batched!(side::Char, uplo::Char, transa::Char, diag::Char, alpha::Number,
+                      A::Vector{<:StridedCuMatrix{T}}, B::Vector{<:StridedCuMatrix{T}},) where T
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    B = trsm_batched!(side, uplo, transa, diag, gpu_α, A, B )
+    synchronize()
+    return B
+end
 function trsm_batched(side::Char, uplo::Char, transa::Char, diag::Char, alpha::Number,
                       A::Vector{<:StridedCuMatrix{T}}, B::Vector{<:StridedCuMatrix{T}}) where T
     trsm_batched!(side, uplo, transa, diag, alpha, A, copy(B) )
@@ -1890,9 +2506,9 @@ for (fname, fname_64, elty) in ((:cublasDgeam, :cublasDgeam_64, :Float64),
     @eval begin
         function geam!(transa::Char,
                        transb::Char,
-                       alpha::Number,
+                       alpha::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        A::StridedCuMatrix{$elty},
-                       beta::Number,
+                       beta::CuRefArray{$elty, CuVector{$elty,  DeviceMemory}},
                        B::StridedCuMatrix{$elty},
                        C::StridedCuMatrix{$elty})
             mA, nA = size(A)
@@ -1914,8 +2530,21 @@ for (fname, fname_64, elty) in ((:cublasDgeam, :cublasDgeam_64, :Float64),
         end
     end
 end
-function geam(transa::Char, transb::Char, alpha::Number, A::StridedCuMatrix{T},
-              beta::Number, B::StridedCuMatrix{T}) where T
+function geam!(transa::Char,
+               transb::Char,
+               alpha::Number,
+               A::StridedCuMatrix{T},
+               beta::Number,
+               B::StridedCuMatrix{T},
+               C::StridedCuMatrix{T}) where {T}
+    gpu_α = CuRef{T}( convert(T, alpha) )
+    gpu_β = CuRef{T}( convert(T, beta) )
+    C = geam!(transa, transb, gpu_α, A, gpu_β, B, C)
+    synchronize()
+    return C
+end
+function geam(transa::Char, transb::Char, alpha::Union{CuRefArray, Number}, A::StridedCuMatrix{T},
+              beta::Union{CuRefArray, Number}, B::StridedCuMatrix{T}) where T
     m,n = size(B)
     if transb == 'T' || transb == 'C'
         geam!(transa, transb, alpha, A, beta, B, similar(B, (n,m) ) )
